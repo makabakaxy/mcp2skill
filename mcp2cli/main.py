@@ -583,11 +583,10 @@ def remove(
     )
     results = run_pipeline(pipeline)
 
-    all_ok = all(results.values())
-    if all_ok:
+    if results.all_ok:
         click.echo(f"\n✅ {server_name} removed successfully!")
     else:
-        failed = [k for k, v in results.items() if not v]
+        failed = results.failed_fatal
         click.echo(f"\n⚠ Removal partially complete. Failed steps: {', '.join(failed)}")
 
 
