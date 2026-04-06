@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import click
@@ -32,8 +33,7 @@ def disable_server(
         elif config_format == "codex_toml":
             return _disable_toml(server_name, config_path)
         return False
-    except Exception as e:
-        click.echo(f"  Warning: Failed to disable {server_name} in {config_path}: {e}", err=True)
+    except Exception:
         return False
 
 
@@ -56,26 +56,25 @@ def _disable_json(server_name: str, config_path: Path) -> bool:
 
 
 def _disable_toml(server_name: str, config_path: Path) -> bool:
-    try:
-        import tomlkit
-    except ImportError:
-        click.echo("  Warning: tomlkit not installed, cannot modify TOML config", err=True)
-        return False
-
     text = config_path.read_text(encoding="utf-8")
-    data = tomlkit.loads(text)
 
-    servers = data.get("mcp_servers", {})
-    if server_name not in servers:
+    m = re.search(
+        rf'^\[mcp_servers\.{re.escape(server_name)}\]',
+        text, re.MULTILINE,
+    )
+    if not m:
         return False
 
-    if servers[server_name].get("disabled"):
-        click.echo(f"  Already disabled in {config_path}")
-        return True
+    rest = text[m.end():]
+    next_section = re.search(r'^\[', rest, re.MULTILINE)
+    section_body = rest[:next_section.start()] if next_section else rest
 
-    servers[server_name]["disabled"] = True
+    if re.search(r'^\s*disabled\s*=', section_body, re.MULTILINE):
+        return True  # already disabled
 
-    atomic_write_text(config_path, tomlkit.dumps(data))
+    insert_pos = m.end()
+    text = text[:insert_pos] + "\ndisabled = true" + text[insert_pos:]
+    atomic_write_text(config_path, text)
     return True
 
 

@@ -37,6 +37,8 @@ mcp2cli convert gitlab-mcp
 
 That's it. Your MCP server is now a CLI, and the compressed skill files are synced to your AI clients.
 
+> **Tip:** After install or convert, you can edit `~/.agents/mcp2cli/servers.yaml` to update env vars (API keys, endpoints, etc.) without re-running the full setup.
+
 ## How It Works
 
 `mcp2cli convert gitlab-mcp` runs a 3-phase pipeline:
@@ -138,26 +140,28 @@ mcp2cli remove gitlab-mcp
 ```
 
 ## Commands
+### List Exist MCP servers
 
-| Command | Description |
-|---------|-------------|
-| `convert <server>` | Convert an MCP server to skill-based usage |
-| `install <server>` | Install a new MCP server and generate skills |
-| `update <server>` | Update tools and regenerate CLI + skills |
-| `remove <server>` | Remove a server and all generated artifacts |
-| `list` | List all configured MCP servers |
-| `scan <server>` | Discover all tools from an MCP server |
-| `tools <server>` | List tools or show tool details |
-| `call <server> <tool>` | Call an MCP tool directly |
-| `generate cli <server>` | (Re)generate the CLI command tree |
-| `generate skill <server>` | (Re)generate skill files |
-| `skill sync <server>` | Sync skill files to AI clients |
-| `skill unsync <server>` | Remove synced skills and re-enable MCP server |
-| `preset list [server]` | Browse available presets (local + remote) |
-| `preset pull <name[@ver]>` | Download a preset, skip AI generation |
-| `preset export <server>` | Export a preset bundle to a local directory |
-| `preset push <server>` | Push local preset to community registry |
-| `validate <server>` | Validate CLI mapping and skill files |
+| Command | When to use |
+|---|---|
+| `mcp2cli list` | Use this to see which MCP servers `mcp2cli` can currently discover before converting or updating anything. |
+
+### Core workflows
+
+| Command | When to use |
+|---|---|
+| `mcp2cli convert <server>` | Use this when the MCP server is already configured in Claude, Cursor, or Codex and you want to convert it into a generated CLI + synced skills. |
+| `mcp2cli install <server>` | Use this when the server is not exist yet and you want `mcp2cli` to install/register it, then generate or pull the CLI + skills for you. |
+| `mcp2cli update <server>` | Use this after the MCP server adds, removes, or changes tools and you need to regenerate the local CLI mapping and skill files. |
+| `mcp2cli uninstall <server>` | Use this when you want to remove generated CLI/skill artifacts for a server. |
+
+### Presets
+| Command | When to use |
+|---|---|
+| `mcp2cli preset list [server]` | Use this to check whether a pre-generated preset already exists before running AI generation. |
+| `mcp2cli preset pull <name[@version]>` | Use this when a preset already exists and you want the CLI + skill files immediately without waiting for scan/generation. |
+| `mcp2cli preset export <server>` | Use this to package your local generated files into a reusable preset bundle. |
+| `mcp2cli preset push <server>` | Use this when you want to publish a local preset to the shared preset registry. |
 
 ## License
 

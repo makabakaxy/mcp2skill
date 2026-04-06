@@ -11,14 +11,20 @@ from mcp2cli.config.models import ServerConfig
 
 @dataclass
 class BatchEntry:
-    """A single MCP server entry for batch conversion."""
+    """A single MCP server entry for batch conversion.
+
+    The ``env`` field supports two formats:
+    - Flat: ``{"KEY": "default_value"}`` — legacy, minimal metadata
+    - Rich: ``{"KEY": {"example": "sk-xxx", "required": true, "sensitive": true}}``
+      — preferred; carries metadata used to prompt users correctly on install
+    """
 
     name: str
     package: str
     type: str  # "npm" or "pip"
     command: str
     args: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str | dict] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> BatchEntry:
@@ -45,13 +51,30 @@ class BatchEntry:
             d["env"] = self.env
         return d
 
+    def env_meta(self) -> dict[str, dict]:
+        """Return rich env metadata suitable for embedding in server_meta.
+
+        Flat values (str) are promoted to ``{"required": true, "sensitive": false}``.
+        Rich values (dict) are used as-is.
+        """
+        result: dict[str, dict] = {}
+        for k, v in self.env.items():
+            if isinstance(v, dict):
+                result[k] = v
+            else:
+                result[k] = {"required": True, "sensitive": False}
+        return result
+
     def to_server_config(self) -> ServerConfig:
-        """Convert to a ServerConfig for scanning."""
+        """Convert to a ServerConfig for scanning.
+
+        Only key names are carried over; actual values are not needed for scanning.
+        """
         return ServerConfig(
             name=self.name,
             command=self.command,
             args=self.args,
-            env=self.env,
+            env={k: "" for k in self.env},
         )
 
 

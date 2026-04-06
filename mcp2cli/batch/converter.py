@@ -37,7 +37,11 @@ def _convert_one(entry: BatchEntry, output_dir: str) -> BatchResult:
     click.echo(f"{'='*60}")
 
     config = entry.to_server_config()
-    tools_json = scan_ephemeral(config, server_meta=config.to_server_meta())
+    server_meta: dict = {"command": config.command, "args": config.args}
+    env_meta = entry.env_meta()
+    if env_meta:
+        server_meta["env"] = env_meta
+    tools_json = scan_ephemeral(config, server_meta=server_meta)
     if tools_json is None:
         return BatchResult(name=name, status="failed", error="scan failed")
 

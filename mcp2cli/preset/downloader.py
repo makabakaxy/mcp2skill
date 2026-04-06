@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 from pathlib import Path
 from urllib.request import urlopen
@@ -162,6 +163,65 @@ def _map_target_path(server_name: str, rel_path: str) -> Path:
     if not resolved.is_relative_to(DATA_DIR.resolve()):
         raise ValueError(f"Path traversal detected in preset manifest: {rel_path}")
     return target
+
+
+def install_from_local_dir(
+    server_name: str,
+    version_dir: Path,
+    force: bool = False,
+) -> bool:
+    """Install preset files from a local version directory.
+
+    version_dir must contain manifest.json, tools.json, cli.yaml, and skills/.
+
+    Returns True on success.
+    """
+    manifest_path = version_dir / "manifest.json"
+    if not manifest_path.exists():
+        click.echo(f"Error: no manifest.json found in {version_dir}", err=True)
+        return False
+
+    try:
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = Manifest.from_dict(manifest_data)
+    except Exception as e:
+        click.echo(f"Error: could not read manifest.json: {e}", err=True)
+        return False
+
+    click.echo(f"Installing from local preset: {version_dir}")
+    click.echo(
+        f"  {manifest.tool_count} tools, "
+        f"generated {manifest.generated_at[:10]}"
+    )
+
+    if not force:
+        existing = _check_existing(server_name, manifest.files)
+        if existing:
+            click.echo(f"\n  Local files already exist for {server_name}:")
+            for f in existing[:5]:
+                click.echo(f"    {f}")
+            if not click.confirm("  Overwrite with local preset?", default=True):
+                return False
+
+    for rel_path in manifest.files:
+        src = version_dir / rel_path
+        if not src.exists():
+            click.echo(f"  Error: missing file {rel_path} in {version_dir}", err=True)
+            return False
+
+        try:
+            target = _map_target_path(server_name, rel_path)
+        except ValueError as e:
+            click.echo(f"  Error: {e}", err=True)
+            return False
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+        click.echo(f"  ✓ {rel_path}")
+
+    ensure_users_dir(skills_path(server_name))
+    click.echo(f"Done! Files written to {DATA_DIR}/")
+    return True
 
 
 def _check_existing(server_name: str, files: list[str]) -> list[Path]:
