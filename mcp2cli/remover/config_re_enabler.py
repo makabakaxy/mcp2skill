@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import click
@@ -29,11 +30,7 @@ def re_enable_server(
         elif config_format == "codex_toml":
             return _re_enable_toml(server_name, config_path)
         return True
-    except Exception as e:
-        click.echo(
-            f"  Warning: failed to re-enable {server_name} in {config_path}: {e}",
-            err=True,
-        )
+    except Exception:
         return False
 
 
@@ -55,25 +52,25 @@ def _re_enable_json(server_name: str, config_path: Path) -> bool:
 
 
 def _re_enable_toml(server_name: str, config_path: Path) -> bool:
-    try:
-        import tomlkit
-    except ImportError:
-        click.echo("  Warning: tomlkit not installed, cannot modify TOML config", err=True)
-        return False
-
     text = config_path.read_text(encoding="utf-8")
-    data = tomlkit.loads(text)
 
-    servers = data.get("mcp_servers", {})
-    if server_name not in servers:
+    m = re.search(
+        rf'^\[mcp_servers\.{re.escape(server_name)}\]',
+        text, re.MULTILINE,
+    )
+    if not m:
         return True
 
-    entry = servers[server_name]
-    if "disabled" not in entry:
-        return True
+    rest = text[m.end():]
+    next_section = re.search(r'^\[', rest, re.MULTILINE)
+    section_end = m.end() + next_section.start() if next_section else len(text)
+    section_body = text[m.end():section_end]
 
-    del entry["disabled"]
-    atomic_write_text(config_path, tomlkit.dumps(data))
+    new_body = re.sub(r'\ndisabled\s*=\s*[^\n]*', '', section_body)
+    if new_body == section_body:
+        return True  # nothing to remove
+
+    atomic_write_text(config_path, text[:m.end()] + new_body + text[section_end:])
     return True
 
 

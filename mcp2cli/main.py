@@ -368,6 +368,8 @@ def skill_unsync_cmd(server_name: str | None, targets: str | None, skip_re_enabl
 @click.option("--skill-targets", help="Skill sync targets (comma-separated)")
 @click.option("--no-preset", is_flag=True, help="Skip preset check")
 @click.option("--preset-version", default=None, help="Use a specific preset version (e.g. 1.2.3)")
+@click.option("--preset-dir", default=None, type=click.Path(exists=True, file_okay=False),
+              help="Use a local preset directory instead of GitHub")
 @click.option("--yes", is_flag=True, help="Skip confirmation")
 def install(
     server_name: str,
@@ -375,20 +377,56 @@ def install(
     skill_targets: str | None,
     no_preset: bool,
     preset_version: str | None,
+    preset_dir: str | None,
     yes: bool,
 ):
     """Install a new MCP server and generate skill files."""
-    from mcp2cli.config.models import ServerConfig
-    from mcp2cli.installer.ai_search import ai_search_server
-    from mcp2cli.installer.interactive import collect_env_values
-    from mcp2cli.installer.pipeline import build_pipeline, run_pipeline
-    from mcp2cli.installer.servers_writer import write_server
-
     preset_envs: dict[str, str] = {}
     for pair in env_pairs:
         if "=" in pair:
             k, v = pair.split("=", 1)
             preset_envs[k] = v
+
+    # --- Local preset fast path (--preset-dir) ---
+    if preset_dir is not None:
+        ok = _try_local_preset_install(
+            server_name, Path(preset_dir), preset_envs, yes,
+        )
+        if ok:
+            return
+        raise SystemExit(1)
+
+    # --- Already configured locally → convert flow ---
+    from mcp2cli.converter.config_extractor import ServerNotFoundError, extract_server_config
+    try:
+        existing_config, existing_sources = extract_server_config(server_name, "auto")
+        _run_convert(
+            server_name=server_name,
+            config=existing_config,
+            no_preset=no_preset,
+            preset_version=preset_version,
+            yes=yes,
+            force=False,
+            skip_disable=False,
+        )
+        return
+    except ServerNotFoundError:
+        pass
+
+    # --- Preset-first fast path ---
+    if not no_preset:
+        ok = _try_preset_install(
+            server_name, preset_envs, preset_version, yes,
+        )
+        if ok:
+            return
+
+    # --- Fallback: AI search flow ---
+    from mcp2cli.config.models import ServerConfig
+    from mcp2cli.installer.ai_search import ai_search_server, build_server_meta
+    from mcp2cli.installer.interactive import collect_env_values
+    from mcp2cli.installer.pipeline import build_pipeline, run_pipeline
+    from mcp2cli.installer.servers_writer import write_server
 
     search_result = ai_search_server(server_name)
     if search_result is None or not search_result.found:
@@ -402,6 +440,9 @@ def install(
         args=search_result.args,
         env=env_values,
     )
+
+    # Build server_meta from AI search result for embedding in tools.json
+    server_meta = build_server_meta(search_result)
 
     if not yes:
         click.echo(f"\nWill write to servers.yaml:")
@@ -428,6 +469,7 @@ def install(
         write_step_name="mcp-add",
         no_preset=no_preset,
         preset_version=preset_version,
+        server_meta=server_meta,
     )
     results = run_pipeline(pipeline)
 
@@ -435,14 +477,279 @@ def install(
         click.echo("\n✅ Installation complete!")
         click.echo(f"  Use CLI: mcp2cli {server_name} --help")
         click.echo(f"  Skill is now available in Claude Code, Cursor, and Codex")
+        click.echo(f"  Tip: edit ~/.agents/mcp2cli/servers.yaml to change env vars (API keys, etc.)")
     else:
         failed = results.failed_fatal
         click.echo(f"\n⚠ Installation partially complete. Failed steps: {', '.join(failed)}")
 
 
+def _resolve_local_preset_dir(server_name: str, preset_dir: Path) -> Path | None:
+    """Resolve the version directory from a user-specified preset directory.
+
+    Priority:
+      1. preset_dir itself contains manifest.json → use as version dir
+      2. preset_dir/<server_name>/<version>/ structure → pick latest version dir
+    """
+    from mcp2cli.utils import safe_filename
+
+    if (preset_dir / "manifest.json").exists():
+        return preset_dir
+
+    server_dir = preset_dir / safe_filename(server_name)
+    if server_dir.exists():
+        version_dirs = sorted(
+            [d for d in server_dir.iterdir()
+             if d.is_dir() and (d / "manifest.json").exists()],
+            reverse=True,
+        )
+        if version_dirs:
+            return version_dirs[0]
+
+    click.echo(
+        f"Error: no preset found in '{preset_dir}' for server '{server_name}'.",
+        err=True,
+    )
+    click.echo(
+        f"  Expected: {preset_dir}/manifest.json, "
+        f"or {preset_dir}/{safe_filename(server_name)}/<version>/manifest.json",
+        err=True,
+    )
+    return None
+
+
+def _try_local_preset_install(
+    server_name: str,
+    preset_dir: Path,
+    preset_envs: dict[str, str],
+    yes: bool,
+) -> bool:
+    """Install from a local preset directory.
+
+    Returns True on success, False on failure.
+    """
+    import json
+
+    version_dir = _resolve_local_preset_dir(server_name, preset_dir)
+    if version_dir is None:
+        return False
+
+    tools_path = version_dir / "tools.json"
+    if not tools_path.exists():
+        click.echo(f"Error: no tools.json found in {version_dir}", err=True)
+        return False
+
+    try:
+        tools_data = json.loads(tools_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        click.echo(f"Error: could not read tools.json: {e}", err=True)
+        return False
+
+    server_meta = tools_data.get("server_meta")
+    if not server_meta:
+        click.echo("Error: tools.json has no server_meta.", err=True)
+        return False
+
+    command = server_meta.get("command", "")
+    args = server_meta.get("args", [])
+    env_defs = server_meta.get("env", {})
+
+    if not command:
+        click.echo("Error: preset server_meta is missing 'command'.", err=True)
+        return False
+
+    from mcp2cli.installer.interactive import collect_env_values
+
+    env_values = collect_env_values(env_defs, preset_envs)
+
+    if not yes:
+        click.echo(f"\nWill write to servers.yaml:")
+        click.echo(f"  {server_name}:")
+        click.echo(f"    command: {command} {' '.join(args)}")
+        if env_values:
+            click.echo(f"    env: {', '.join(env_values.keys())} ({len(env_values)} values set)")
+        click.echo(f"  Source: local preset at {version_dir}")
+        if not click.confirm("\nProceed?", default=True):
+            click.echo("Aborted.")
+            raise SystemExit(0)
+
+    from mcp2cli.config.models import ServerConfig
+    from mcp2cli.installer.servers_writer import write_server
+
+    config = ServerConfig(
+        name=server_name,
+        command=command,
+        args=args,
+        env=env_values,
+    )
+    if not write_server(config):
+        return False
+
+    from mcp2cli.preset.downloader import install_from_local_dir
+
+    click.echo("Installing from local preset...")
+    ok = install_from_local_dir(server_name, version_dir, force=True)
+    if not ok:
+        return False
+
+    from mcp2cli.installer.skill_sync import skill_sync
+
+    click.echo("Syncing skills...")
+    skill_sync(server_name)
+
+    click.echo("\n✅ Installation complete! (local preset)")
+    click.echo(f"  Use CLI: mcp2cli {server_name} --help")
+    click.echo(f"  Skill is now available in Claude Code, Cursor, and Codex")
+    click.echo(f"  Tip: edit ~/.agents/mcp2cli/servers.yaml to change env vars (API keys, etc.)")
+    return True
+
+
+def _try_preset_install(
+    server_name: str,
+    preset_envs: dict[str, str],
+    preset_version: str | None,
+    yes: bool,
+) -> bool:
+    """Try to install from a remote preset (fast path).
+
+    Returns True if preset install succeeded, False to fall back to AI search.
+    """
+    from mcp2cli.preset.checker import probe_preset_with_alias
+
+    probe = probe_preset_with_alias(server_name, version=preset_version)
+    if probe.entry is None:
+        return False
+
+    # Alias resolution feedback
+    canonical_name = probe.resolved_name
+    if probe.alias_used:
+        click.echo(f"  '{server_name}' → '{canonical_name}' (alias match)")
+
+    entry = probe.entry
+    click.echo(
+        f"\nFound preset: {canonical_name}@{entry.latest} "
+        f"({entry.tool_count} tools)"
+    )
+    if entry.description:
+        click.echo(f"  {entry.description}")
+
+    # Fetch server_meta from remote tools.json
+    from mcp2cli.preset.checker import fetch_server_meta_from_preset
+
+    server_meta = fetch_server_meta_from_preset(canonical_name, version=preset_version)
+    if server_meta is None:
+        click.echo("  Preset has no server_meta. Falling back to AI search.")
+        return False
+
+    command = server_meta.get("command", "")
+    args = server_meta.get("args", [])
+    env_defs = server_meta.get("env", {})
+
+    if not command:
+        click.echo("  Preset server_meta is incomplete. Falling back to AI search.")
+        return False
+
+    # Collect env values interactively
+    from mcp2cli.installer.interactive import collect_env_values
+
+    env_values = collect_env_values(env_defs, preset_envs)
+
+    # Show summary and confirm
+    if not yes:
+        click.echo(f"\nWill write to servers.yaml:")
+        click.echo(f"  {canonical_name}:")
+        click.echo(f"    command: {command} {' '.join(args)}")
+        if env_values:
+            click.echo(f"    env: {', '.join(env_values.keys())} ({len(env_values)} values set)")
+        if not click.confirm("\nProceed?", default=True):
+            click.echo("Aborted.")
+            raise SystemExit(0)
+
+    # Write servers.yaml
+    from mcp2cli.config.models import ServerConfig
+    from mcp2cli.installer.servers_writer import write_server
+
+    config = ServerConfig(
+        name=canonical_name,
+        command=command,
+        args=args,
+        env=env_values,
+    )
+    if not write_server(config):
+        return False
+
+    # Pull preset files (tools.json, cli.yaml, skills/)
+    from mcp2cli.preset.downloader import pull_preset
+
+    click.echo("Pulling preset...")
+    ok = pull_preset(canonical_name, version=preset_version, force=True)
+    if not ok:
+        click.echo("  Preset download failed.", err=True)
+        return False
+
+    # Skill sync
+    from mcp2cli.installer.skill_sync import skill_sync
+
+    click.echo("Syncing skills...")
+    skill_sync(canonical_name)
+
+    click.echo("\n✅ Installation complete! (preset-based, no AI search)")
+    click.echo(f"  Use CLI: mcp2cli {canonical_name} --help")
+    click.echo(f"  Skill is now available in Claude Code, Cursor, and Codex")
+    click.echo(f"  Tip: edit ~/.agents/mcp2cli/servers.yaml to change env vars (API keys, etc.)")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # convert
 # ---------------------------------------------------------------------------
+
+def _run_convert(
+    server_name: str,
+    config,
+    no_preset: bool,
+    preset_version: str | None,
+    yes: bool,
+    force: bool,
+    skip_disable: bool,
+) -> None:
+    """Core convert logic shared by `install` (local fast-path) and `convert` command."""
+    from mcp2cli.installer.pipeline import build_pipeline, run_pipeline
+    from mcp2cli.preset.checker import probe_preset
+
+    preset_entry = probe_preset(server_name, version=preset_version, no_preset=no_preset)
+
+    if preset_entry is not None:
+        _display_preset_info(preset_entry, preset_version)
+    else:
+        if not yes:
+            if not click.confirm("\nProceed?", default=True):
+                click.echo("Aborted.")
+                return
+
+    server_meta = config.to_server_meta()
+
+    pipeline = build_pipeline(
+        server_name=server_name,
+        config=config,
+        force_write=force,
+        skip_disable=skip_disable,
+        no_preset=no_preset,
+        preset_version=preset_version,
+        server_meta=server_meta,
+    )
+    results = run_pipeline(pipeline)
+
+    if results.all_ok:
+        click.echo("\n✅ Convert complete!")
+        if not skip_disable:
+            click.echo("  Original MCP config disabled (can re-enable manually)")
+        else:
+            click.echo("  Original MCP config was NOT disabled (--skip-disable)")
+        click.echo(f"  Tip: edit ~/.agents/mcp2cli/servers.yaml to change env vars (API keys, etc.)")
+    else:
+        failed = results.failed_fatal
+        click.echo(f"\n⚠ Convert partially complete. Failed steps: {', '.join(failed)}")
+
 
 @cli.command()
 @click.argument("server_name")
@@ -463,7 +770,6 @@ def convert(
 ):
     """Convert an already-configured MCP server to skill-based usage."""
     from mcp2cli.converter.config_extractor import ServerNotFoundError, extract_server_config
-    from mcp2cli.installer.pipeline import build_pipeline, run_pipeline
 
     click.echo(f"Finding {server_name} in config sources...")
 
@@ -482,38 +788,15 @@ def convert(
     if config.env:
         click.echo(f"  env: {', '.join(config.env.keys())} ({len(config.env)} vars)")
 
-    # Probe for preset before confirmation
-    from mcp2cli.preset.checker import probe_preset
-
-    preset_entry = probe_preset(server_name, version=preset_version, no_preset=no_preset)
-
-    if preset_entry is not None:
-        _display_preset_info(preset_entry, preset_version)
-    else:
-        if not yes:
-            if not click.confirm("\nProceed?", default=True):
-                click.echo("Aborted.")
-                return
-
-    pipeline = build_pipeline(
+    _run_convert(
         server_name=server_name,
         config=config,
-        force_write=force,
-        skip_disable=skip_disable,
         no_preset=no_preset,
         preset_version=preset_version,
+        yes=yes,
+        force=force,
+        skip_disable=skip_disable,
     )
-    results = run_pipeline(pipeline)
-
-    if results.all_ok:
-        click.echo("\n✅ Convert complete!")
-        if not skip_disable:
-            click.echo("  Original MCP config disabled (can re-enable manually)")
-        else:
-            click.echo("  Original MCP config was NOT disabled (--skip-disable)")
-    else:
-        failed = results.failed_fatal
-        click.echo(f"\n⚠ Convert partially complete. Failed steps: {', '.join(failed)}")
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +1165,146 @@ def preset_push_cmd(server_name: str, preset_version: str | None, yes: bool):
 
 # Alias: export = preset export
 cli.add_command(preset_export_cmd, "export")
+
+
+# ---------------------------------------------------------------------------
+# batch
+# ---------------------------------------------------------------------------
+
+@cli.group("batch")
+def batch_group():
+    """Batch operations for converting multiple MCP servers."""
+    pass
+
+
+@batch_group.command("fetch")
+@click.option(
+    "--source", default="mcpmarket",
+    help="Data source for server list (default: mcpmarket)",
+)
+@click.option("--top", default=100, help="Number of top servers to fetch")
+@click.option(
+    "-o", "--output", "output_file", default="servers.json",
+    help="Output file path (default: servers.json)",
+)
+@click.option(
+    "--no-details", is_flag=True,
+    help="Skip fetching individual server detail pages (faster but less info)",
+)
+@click.option(
+    "--delay", default=0.5, type=float,
+    help="Delay between detail page requests in seconds (default: 0.5)",
+)
+def batch_fetch_cmd(
+    source: str,
+    top: int,
+    output_file: str,
+    no_details: bool,
+    delay: float,
+):
+    """Fetch a list of MCP servers from an online directory.
+
+    Scrapes the mcpmarket.com leaderboard to build a servers.json file
+    that can be used with `mcp2cli batch convert`.
+
+    \b
+    Example:
+      mcp2cli batch fetch --top 50 -o servers.json
+      mcp2cli batch fetch --no-details -o servers.json
+    """
+    if source != "mcpmarket":
+        click.echo(f"Error: unsupported source '{source}'. Only 'mcpmarket' is supported.", err=True)
+        raise SystemExit(1)
+
+    from mcp2cli.batch.fetcher import fetch_mcpmarket_list
+    from mcp2cli.batch.models import save_batch_input
+
+    entries = fetch_mcpmarket_list(
+        top=top,
+        fetch_details=not no_details,
+        delay=delay,
+    )
+
+    if not entries:
+        click.echo("No servers found.", err=True)
+        raise SystemExit(1)
+
+    output_path = Path(output_file)
+    save_batch_input(entries, output_path)
+    click.echo(f"\nWritten to {output_path}")
+    click.echo(f"Review and edit the file, then run:")
+    click.echo(f"  mcp2cli batch convert --input {output_path} -o ./presets")
+
+
+@batch_group.command("convert")
+@click.option(
+    "--input", "input_file", required=True,
+    type=click.Path(exists=True),
+    help="Path to servers.json (from `batch fetch` or manually created)",
+)
+@click.option(
+    "-o", "--output", "output_dir", default="./presets",
+    help="Output directory for preset bundles (default: ./presets)",
+)
+@click.option(
+    "--skip-existing/--no-skip-existing", default=True,
+    help="Skip servers that already have a preset in the output directory (default: enabled)",
+)
+@click.option(
+    "--force", is_flag=True,
+    help="Force reconvert even if preset exists (overrides --skip-existing)",
+)
+@click.option(
+    "--concurrency", default=1, type=int,
+    help="Number of parallel conversions (default: 1)",
+)
+def batch_convert_cmd(
+    input_file: str,
+    output_dir: str,
+    skip_existing: bool,
+    force: bool,
+    concurrency: int,
+):
+    """Batch convert multiple MCP servers to preset bundles.
+
+    Reads a servers.json file and for each server: scans tools via
+    ephemeral npx/uvx, generates CLI mapping and skill files via AI,
+    then exports the preset bundle to the output directory.
+
+    \b
+    Example:
+      mcp2cli batch convert --input servers.json -o ./presets
+      mcp2cli batch convert --input servers.json --force
+      mcp2cli batch convert --input failed.json -o ./presets
+    """
+    from mcp2cli.batch.converter import batch_convert
+    from mcp2cli.batch.models import load_batch_input
+
+    entries = load_batch_input(Path(input_file))
+    click.echo(f"Loaded {len(entries)} servers from {input_file}")
+
+    # Filter out entries without command/args
+    valid = [e for e in entries if e.command and e.args]
+    skipped_invalid = len(entries) - len(valid)
+    if skipped_invalid:
+        click.echo(f"  {skipped_invalid} entries skipped (missing command/args)")
+
+    if not valid:
+        click.echo("No valid entries to convert.", err=True)
+        raise SystemExit(1)
+
+    effective_skip = skip_existing and not force
+    results = batch_convert(
+        entries=valid,
+        output_dir=output_dir,
+        skip_existing=effective_skip,
+        concurrency=concurrency,
+    )
+
+    # Exit with error if any fatal failures
+    failed = [r for r in results if r.status == "failed"]
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
