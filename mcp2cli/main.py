@@ -653,16 +653,12 @@ def _try_preset_install(
 
     env_values = collect_env_values(env_defs, preset_envs)
 
-    # Show summary and confirm
-    if not yes:
-        click.echo(f"\nWill write to servers.yaml:")
-        click.echo(f"  {canonical_name}:")
-        click.echo(f"    command: {command} {' '.join(args)}")
-        if env_values:
-            click.echo(f"    env: {', '.join(env_values.keys())} ({len(env_values)} values set)")
-        if not click.confirm("\nProceed?", default=True):
-            click.echo("Aborted.")
-            raise SystemExit(0)
+    # Show summary
+    click.echo(f"\nWill write to servers.yaml:")
+    click.echo(f"  {canonical_name}:")
+    click.echo(f"    command: {command} {' '.join(args)}")
+    if env_values:
+        click.echo(f"    env: {', '.join(env_values.keys())} ({len(env_values)} values set)")
 
     # Write servers.yaml
     from mcp2cli.config.models import ServerConfig
